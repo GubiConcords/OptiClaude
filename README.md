@@ -1,0 +1,26 @@
+# OptiClaude
+
+*unbeatable efficiency*
+
+A Claude Code mod that predicts a prompt's token cost before you send it and recommends a model and effort for the task (Haiku for "fix all typos", Opus for a migration). Everything is computed locally: using the mod costs 0 tokens.
+
+- **OC** button above the prompt opens the panel
+- Prompt estimate: this prompt, context re-read on send, expected whole turn (learns from your real turns)
+- Recommended model and effort, with "Use for next prompt" and Auto mode
+- Session and weekly usage bars
+
+## Install
+
+At the prompt of a Claude Code terminal session:
+
+```
+/plugin install opticlaude --marketplace GubiConcords/OptiClaude
+```
+
+From a shell:
+
+```bash
+claude plugin install opticlaude --marketplace GubiConcords/OptiClaude
+```
+
+In the desktop app: click **+** next to the prompt box, then **Plugins**, **Add marketplace** with `GubiConcords/OptiClaude`, then **Add plugin**.

@@ -1,0 +1,6 @@
+{
+  "name": "opticlaude",
+  "version": "0.1.1",
+  "description": "Predicts a prompt's token cost before you send it and recommends a model and effort, computed locally at zero token cost",
+  "types": "./types/index.d.ts"
+}
