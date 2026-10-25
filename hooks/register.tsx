@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, SessionRateLimit } from 'claude-code'
 
-import type { Advice, Calibration, Tier } from '../types'
+import type { Advice, Calibration, Stats, Tier } from '../types'
 import { advise, compact, countTokens } from './estimate'
 import { LOGO_SVG, barSvg } from './logo'
 
@@ -22,10 +22,41 @@ const calibration = atom({ plugin: 'opticlaude', key: 'calibration' } as const, 
   moderate: { tokens: 0, percent: 0, n: 0 },
   heavy: { tokens: 0, percent: 0, n: 0 },
 } satisfies Calibration)
+const EMPTY_STATS: Stats = {
+  turn: null,
+  live: { tools: 0, agents: 0 },
+  sessionTokens: 0,
+  sessionOutput: 0,
+  models: {},
+  bigTools: [],
+  lastCallAt: null,
+  burnFrom: null,
+}
+const stats = atom({ plugin: 'opticlaude', key: 'stats' } as const, EMPTY_STATS)
+// Bumped every second so the cache countdown moves while the pane is up.
+const tick = atom({ plugin: 'opticlaude', key: 'tick' } as const, 0)
+
+const LIFETIME_KEY = 'lifetimeUsd'
+// The prompt cache keeps an entry 5 minutes after its last use by default.
+const CACHE_MS = 5 * 60_000
+const SUBAGENT_TOOLS = new Set(['Agent', 'Task'])
 
 const LIMITS: Record<string, string> = {
   five_hour: 'Session limit',
   seven_day: 'Weekly · all models',
+}
+
+function duration(ms: number): string {
+  const minutes = Math.round(ms / 60_000)
+  if (minutes < 60) {
+    return `${minutes} min`
+  }
+
+  return `${Math.floor(minutes / 60)} hr ${minutes % 60} min`
+}
+
+function usd(value: number): string {
+  return value < 1 ? `$${value.toFixed(3)}` : `$${value.toFixed(2)}`
 }
 
 function sessionPercent(limits: readonly SessionRateLimit[]): number | undefined {
@@ -63,12 +94,17 @@ export const register: Register = on => {
   let routing: Advice | null = null
   let turnTier: Tier | null = null
   let percentAtStart: number | undefined
+  let usdAtStart = 0
+  let stopTicking: (() => void) | undefined
 
   on('session.start', async ($, e, next) => {
     const saved = (await $.store.get(STORE_KEY)) as Calibration | undefined
     if (saved?.trivial && saved.moderate && saved.heavy) {
       await update($, calibration, () => saved)
     }
+    stopTicking?.()
+    const timer = $.clock.every(1000, () => void update($, tick, n => n + 1))
+    stopTicking = () => timer.cancel()
 
     return next(e)
   })
@@ -96,6 +132,10 @@ export const register: Register = on => {
       percentAtStart = sessionPercent((await $.session.usage()).rateLimits)
       await update($, armed, () => null)
     }
+    if (!e.isMeta && e.command === undefined) {
+      usdAtStart = (await $.session.usage()).cost?.usd ?? 0
+      await update($, stats, all => ({ ...all, live: { tools: 0, agents: 0 } }))
+    }
 
     return next(e)
   })
@@ -104,15 +144,72 @@ export const register: Register = on => {
     if (e.agentId !== undefined) {
       return yield* next(e)
     }
-    if (routing) {
-      return yield* next({ ...e, model: routing.model, effort: routing.effort })
+    if (!routing) {
+      await update($, lastModel, () => e.model)
     }
-    await update($, lastModel, () => e.model)
+    const result = yield* next(routing ? { ...e, model: routing.model, effort: routing.effort } : e)
+    const at = await $.clock.now()
+    await update($, stats, all => ({ ...all, lastCallAt: at }))
 
-    return yield* next(e)
+    return result
+  })
+
+  // Tool calls, subagents and the size of each result, counted locally.
+  on('tool.call', async ($, e, next) => {
+    const result = await next(e)
+    const tokens = countTokens(result.text ?? '')
+    const isAgent = SUBAGENT_TOOLS.has(e.tool)
+    await update($, stats, all => ({
+      ...all,
+      live: {
+        tools: all.live.tools + (e.agentId === undefined ? 1 : 0),
+        agents: all.live.agents + (isAgent ? 1 : 0),
+      },
+      bigTools: [...all.bigTools, { name: e.tool, tokens }].sort((a, b) => b.tokens - a.tokens).slice(0, 3),
+    }))
+
+    return result
   })
 
   on('turn.complete', async ($, e, next) => {
+    const spent = e.usage
+    if (spent) {
+      const total =
+        spent.input_tokens + spent.output_tokens + spent.cache_read_input_tokens + spent.cache_creation_input_tokens
+      const now = await $.clock.now()
+      const usage = await $.session.usage()
+      const percent = sessionPercent(usage.rateLimits)
+      const turnUsd = e.agentId === undefined ? Math.max(0, (usage.cost?.usd ?? 0) - usdAtStart) : 0
+      await update($, stats, all => ({
+        ...all,
+        turn:
+          e.agentId === undefined
+            ? {
+                input: spent.input_tokens,
+                output: spent.output_tokens,
+                cacheRead: spent.cache_read_input_tokens,
+                cacheWrite: spent.cache_creation_input_tokens,
+                usd: turnUsd,
+                tools: all.live.tools,
+                agents: all.live.agents,
+              }
+            : all.turn,
+        sessionTokens: all.sessionTokens + total,
+        sessionOutput: all.sessionOutput + spent.output_tokens,
+        models: { ...all.models, [spent.model]: (all.models[spent.model] ?? 0) + total },
+        lastCallAt: now,
+        burnFrom:
+          percent === undefined
+            ? all.burnFrom
+            : all.burnFrom === null || percent < all.burnFrom.percent
+              ? { at: now, percent }
+              : all.burnFrom,
+      }))
+      if (turnUsd > 0) {
+        const was = ((await $.store.get(LIFETIME_KEY)) as number | undefined) ?? 0
+        await $.store.set(LIFETIME_KEY, was + turnUsd)
+      }
+    }
     if (e.agentId !== undefined || turnTier === null) {
       return next(e)
     }
@@ -193,6 +290,11 @@ export const register: Register = on => {
     const learned = await read($, calibration)
     const usage = await $.session.usage()
     const now = await $.clock.now()
+    const spent = await read($, stats)
+    await read($, tick)
+    const lifetime = ((await $.store.get(LIFETIME_KEY)) as number | undefined) ?? 0
+    // `summary` estimates each category locally: no request, no tokens.
+    const breakdown = (await $.session.usage({ breakdown: 'summary', columns: e.props.bodyColumns })).context.breakdown
 
     const tokens = countTokens(text)
     const advice = advise(text)
@@ -322,8 +424,116 @@ export const register: Register = on => {
           </Box>
         )}
 
+        {(() => {
+          if (spent.lastCallAt === null) {
+            return row('Cache', 'no request yet')
+          }
+          const left = CACHE_MS - (now - spent.lastCallAt)
+          if (left <= 0) {
+            return (
+              <Box flexDirection="column">
+                {header('Cache')}
+                <Text color="warning">Expired: the next prompt re-writes {compact(context)} tokens.</Text>
+              </Box>
+            )
+          }
+          const seconds = Math.ceil(left / 1000)
+
+          return (
+            <Box flexDirection="column">
+              {header('Cache')}
+              {row('Warm, expires in', `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}`)}
+              {seconds < 60 && <Text color="warning">Send soon to keep the cache.</Text>}
+            </Box>
+          )
+        })()}
+
+        <Box flexDirection="column">
+          {header('Cost')}
+          {spent.turn && row('Last turn', usd(spent.turn.usd))}
+          {usage.cost && row('This session', usd(usage.cost.usd))}
+          {row('Running total', usd(Math.max(lifetime, usage.cost?.usd ?? 0)))}
+        </Box>
+
+        {spent.turn && (
+          <Box flexDirection="column">
+            {header('Last turn')}
+            {row('Input · cache read', `${compact(spent.turn.input)} · ${compact(spent.turn.cacheRead)}`)}
+            {row('Cache written', compact(spent.turn.cacheWrite))}
+            {row('Output (incl. thinking)', compact(spent.turn.output))}
+            {row('Tool calls · subagents', `${spent.turn.tools} · ${spent.turn.agents}`)}
+          </Box>
+        )}
+        {(spent.live.tools > 0 || spent.live.agents > 0) &&
+          row('This turn so far', `${spent.live.tools} tools · ${spent.live.agents} agents`)}
+
+        {(() => {
+          const percent = sessionPercent(usage.rateLimits)
+          const from = spent.burnFrom
+          if (percent === undefined || from === null || now - from.at < 60_000 || percent <= from.percent) {
+            return null
+          }
+          const perHour = ((percent - from.percent) / (now - from.at)) * 3_600_000
+          const limit = usage.rateLimits.find(each => each.kind === 'five_hour')
+          const reset = limit?.resetsAt ? Date.parse(limit.resetsAt) : NaN
+          const hitIn = ((100 - percent) / perHour) * 3_600_000
+          const isSafe = !Number.isNaN(reset) && now + hitIn > reset
+
+          return (
+            <Box flexDirection="column">
+              {header('Burn rate')}
+              {row('Session limit', `+${perHour.toFixed(1)}% / hr`)}
+              {isSafe ? (
+                <Text dimColor>At this pace you will not hit it before it resets.</Text>
+              ) : (
+                <Text color="warning">At this pace you hit it in {duration(hitIn)}.</Text>
+              )}
+            </Box>
+          )
+        })()}
+
+        {breakdown && (
+          <Box flexDirection="column">
+            {header(`Context · ${compact(breakdown.totalTokens)} of ${compact(breakdown.rawMaxTokens)}`)}
+            {breakdown.categories
+              .filter(category => category.kind === 'used' && category.tokens > 0)
+              .sort((a, b) => b.tokens - a.tokens)
+              .slice(0, 5)
+              .map(category => row(category.name, compact(category.tokens)))}
+            {breakdown.isAutoCompactEnabled &&
+              breakdown.autoCompactThreshold !== undefined &&
+              breakdown.totalTokens >= breakdown.autoCompactThreshold * 0.8 && (
+                <Text color="warning">
+                  Auto-compaction soon ({compact(breakdown.autoCompactThreshold)}). Run /compact, or /clear for a new
+                  task.
+                </Text>
+              )}
+          </Box>
+        )}
+
+        {spent.bigTools.length > 0 && (
+          <Box flexDirection="column">
+            {header('Biggest tool outputs')}
+            {spent.bigTools.map(each => row(each.name, `≈ ${compact(each.tokens)}`))}
+          </Box>
+        )}
+
+        {spent.sessionTokens > 0 && (
+          <Box flexDirection="column">
+            {header('By model · this session')}
+            {Object.entries(spent.models)
+              .sort((a, b) => b[1] - a[1])
+              .map(([id, tokens]) =>
+                row(id.replace(/^claude-/, ''), `${Math.round((tokens / spent.sessionTokens) * 100)}% · ${compact(tokens)}`),
+              )}
+          </Box>
+        )}
+
         <Text dimColor size="caption">
           Estimated locally · costs 0 tokens
+        </Text>
+        <Text dimColor size="caption">
+          v1.0
         </Text>
       </Box>
     )

@@ -63,6 +63,8 @@ test('the band and pane show the draft on every surface', async ($, on) => {
     expect(await pane.find({ type: 'Text', text: /Session limit/ })).toBeDefined()
     expect(await pane.find({ type: 'Text', text: /costs 0 tokens/ })).toBeDefined()
     expect(await pane.find({ key: 'arm' })).toBeDefined()
+    expect(await pane.find({ type: 'Text', text: /^v1.0$/ })).toBeDefined()
+    expect(await pane.find({ type: 'Text', text: /Running total/ })).toBeDefined()
     await pane.unmount()
   }
 })
