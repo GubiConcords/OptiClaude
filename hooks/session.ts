@@ -179,7 +179,7 @@ export type Host = {
   process: Pick<EngineInterface['process'], 'spawn'>
   session: Pick<EngineInterface['session'], 'id' | 'root'>
   clock: Pick<EngineInterface['clock'], 'now'>
-  env?: Pick<EngineInterface['env'], 'get'>
+  env: Pick<EngineInterface['env'], 'get'>
 }
 
 export const FS_READ_LIMIT = 4 * 1024 * 1024
@@ -196,17 +196,19 @@ function join(...parts: string[]): string {
 }
 
 async function configDir($: Host): Promise<string | null> {
-  // Not every host gives a plugin the environment (the test kit does not).
-  if (typeof $.env?.get !== 'function') {
+  // The engine only accepts `$.noun.event(...)` spelled at the call site, so
+  // a host without an environment (a test's fake) is caught, not checked for.
+  try {
+    const own = await $.env.get('CLAUDE_CONFIG_DIR')
+    if (own) {
+      return own
+    }
+    const home = (await $.env.get('HOME')) ?? (await $.env.get('USERPROFILE'))
+
+    return home ? join(home, '.claude') : null
+  } catch {
     return null
   }
-  const own = await $.env.get('CLAUDE_CONFIG_DIR')
-  if (own) {
-    return own
-  }
-  const home = (await $.env.get('HOME')) ?? (await $.env.get('USERPROFILE'))
-
-  return home ? join(home, '.claude') : null
 }
 
 export type Locate = {
