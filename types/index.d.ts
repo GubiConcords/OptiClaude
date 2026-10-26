@@ -13,6 +13,39 @@ export type Advice = {
   turnHigh: number
 }
 
+export type ModelId = 'claude-haiku-5-5' | 'claude-sonnet-5-5' | 'claude-opus-5-5'
+
+/** Where the context tokens go, in tokens. */
+export type ContextBreakdown = {
+  messages: number
+  systemTools: number
+  mcpTools: number
+  skills: number
+  systemPrompt: number
+}
+
+/** Output and thinking tokens of one finished turn. Thinking is billed as output. */
+export type TurnOutput = { output: number; thinking: number }
+
+/** Everything the estimators need from a session. The log parser fills it; a stub does for now. */
+export type SessionSnapshot = {
+  /** Epoch ms the snapshot was taken, so the estimators stay pure. */
+  now: number
+  model: ModelId
+  effort: Effort
+  contextTokens: number
+  contextWindow: number
+  breakdown: ContextBreakdown
+  cache: {
+    /** Epoch ms of the last cache write and read, null when none happened. */
+    lastWriteAt: number | null
+    lastReadAt: number | null
+    ttlMs: number
+  }
+  /** Oldest first. */
+  turns: TurnOutput[]
+}
+
 /** Learned averages per tier: whole-turn tokens and the rise of the session limit in percent points. */
 export type Calibration = Record<Tier, { tokens: number; percent: number; n: number }>
 
