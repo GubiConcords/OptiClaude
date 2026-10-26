@@ -15,24 +15,39 @@ export type Advice = {
 
 export type ModelId = 'claude-haiku-5-5' | 'claude-sonnet-5-5' | 'claude-opus-5-5'
 
-/** Where the context tokens go, in tokens. */
+/**
+ * Where the context tokens go, in tokens. The five named categories plus
+ * `other` add up to `SessionSnapshot.contextTokens`.
+ */
 export type ContextBreakdown = {
   messages: number
   systemTools: number
   mcpTools: number
   skills: number
   systemPrompt: number
+  /**
+   * What the log cannot attribute: older logs record no system prompt or tool
+   * definitions, so their share of the real total lands here instead of
+   * being guessed into a category.
+   */
+  other: number
 }
 
-/** Output and thinking tokens of one finished turn. Thinking is billed as output. */
+/**
+ * Output tokens of one finished turn, split. The API's `output_tokens`
+ * already includes thinking, so `output` here is the non-thinking part and
+ * `output + thinking` is what was billed as output.
+ */
 export type TurnOutput = { output: number; thinking: number }
 
-/** Everything the estimators need from a session. The log parser fills it; a stub does for now. */
+/** Everything the estimators need from a session, filled by the session log parser. */
 export type SessionSnapshot = {
   /** Epoch ms the snapshot was taken, so the estimators stay pure. */
   now: number
-  model: ModelId
-  effort: Effort
+  /** The main loop's last model as the log spells it; may be one the price table does not know. */
+  model: ModelId | (string & {})
+  /** Null when the log does not say. */
+  effort: Effort | null
   contextTokens: number
   contextWindow: number
   breakdown: ContextBreakdown
@@ -81,6 +96,10 @@ declare module 'claude-code' {
       draft: string
       scratch: string
       isAuto: boolean
+      shareAlert: number
+      dismissedTips: string[]
+      copyNote: string
+      showHistory: boolean
       armed: Advice | null
       lastModel: string | null
       calibration: Calibration

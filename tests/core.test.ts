@@ -9,9 +9,9 @@ import { stubProvider, stubSnapshot } from '../hooks/session'
 
 // Made-up round numbers so the maths is checkable. The real prices live in hooks/pricing.ts.
 const FAKE: PriceTable = {
-  'claude-haiku-5-5': { input: 1, output: 5, cacheWrite: 1.25, cacheRead: 0.1 },
-  'claude-sonnet-5-5': { input: 3, output: 10, cacheWrite: 2, cacheRead: 0.1 },
-  'claude-opus-5-5': { input: 15, output: 50, cacheWrite: 20, cacheRead: 1 },
+  'claude-haiku-5-5': { input: 1, output: 5, cacheWrite: 1.25, cacheWrite1h: 2, cacheRead: 0.1 },
+  'claude-sonnet-5-5': { input: 3, output: 10, cacheWrite: 2, cacheWrite1h: 6, cacheRead: 0.1 },
+  'claude-opus-5-5': { input: 15, output: 50, cacheWrite: 20, cacheWrite1h: 30, cacheRead: 1 },
 }
 
 function near(actual: number | undefined | null, expected: number) {
@@ -19,11 +19,11 @@ function near(actual: number | undefined | null, expected: number) {
   expect(Math.abs((actual as number) - expected)).toBeLessThan(1e-9)
 }
 
-test('stub provider returns a complete snapshot', () => {
-  const s = stubProvider()
+test('stub provider returns a complete snapshot', async () => {
+  const s = await stubProvider()
   expect(s.model).toBe('claude-sonnet-5-5')
   expect(s.turns.length).toBeGreaterThan(0)
-  expect(Object.keys(s.breakdown)).toEqual(['messages', 'systemTools', 'mcpTools', 'skills', 'systemPrompt'])
+  expect(Object.keys(s.breakdown)).toEqual(['messages', 'systemTools', 'mcpTools', 'skills', 'systemPrompt', 'other'])
   expect(stubSnapshot({ effort: 'max' }).effort).toBe('max')
 })
 

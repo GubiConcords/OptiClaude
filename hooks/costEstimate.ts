@@ -1,5 +1,5 @@
-import type { Effort, ModelId, SessionSnapshot } from '../types'
-import { type PriceTable, PRICES, ratesFor, usd } from './pricing'
+import type { Effort, SessionSnapshot } from '../types'
+import { type PriceTable, PRICES, ratesFor, usd, writeRate } from './pricing'
 
 export type CacheState = 'warm' | 'cold'
 
@@ -17,8 +17,9 @@ export type Cost = {
 }
 
 export type SendEstimate = {
-  model: ModelId
-  effort: Effort
+  model: string
+  /** Null when neither the options nor the session say. */
+  effort: Effort | null
   /** The cache's state now; another model than the session's is always cold. */
   state: CacheState
   warm: Cost
@@ -32,7 +33,7 @@ export type SendEstimate = {
 }
 
 export type EstimateOptions = {
-  model?: ModelId
+  model?: string
   effort?: Effort
   prices?: PriceTable
 }
@@ -83,7 +84,8 @@ function build(inputTokens: number, inputUsd: number | null, tokens: Range, rate
 /**
  * Cost of sending a prompt of `promptTokens` next. Warm: the context is read
  * from the cache and only the new prompt is written. Cold: the whole context
- * and the prompt are written afresh.
+ * and the prompt are written afresh. Writes are priced at the session's own
+ * cache lifetime (5 minutes or 1 hour).
  */
 export function estimateNextSend(s: SessionSnapshot, promptTokens: number, options: EstimateOptions = {}): SendEstimate {
   const model = options.model ?? s.model
@@ -91,19 +93,22 @@ export function estimateNextSend(s: SessionSnapshot, promptTokens: number, optio
   const context = Math.max(0, s.contextTokens)
   const prompt = Math.max(0, promptTokens)
   const rates = ratesFor(model, options.prices ?? PRICES)
+  const write = rates === null ? null : writeRate(rates, s.cache.ttlMs)
 
-  const scale = EFFORT_OUTPUT_SCALE[effort] / EFFORT_OUTPUT_SCALE[s.effort]
+  // The history was written at the session's effort; with that unknown it is
+  // taken as written at the asked one, so no scaling.
+  const scale = effort === null || s.effort === null ? 1 : EFFORT_OUTPUT_SCALE[effort] / EFFORT_OUTPUT_SCALE[s.effort]
   const base = outputRange(s)
   const tokens = { low: base.low * scale, expected: base.expected * scale, high: base.high * scale }
   const outRate = rates === null ? null : rates.output
 
   const warm = build(
     context + prompt,
-    rates === null ? null : usd(context, rates.cacheRead) + usd(prompt, rates.cacheWrite),
+    rates === null || write === null ? null : usd(context, rates.cacheRead) + usd(prompt, write),
     tokens,
     outRate,
   )
-  const cold = build(context + prompt, rates === null ? null : usd(context + prompt, rates.cacheWrite), tokens, outRate)
+  const cold = build(context + prompt, write === null ? null : usd(context + prompt, write), tokens, outRate)
 
   // A cache belongs to one model: a different model starts cold.
   const state: CacheState = model === s.model ? cacheState(s) : 'cold'

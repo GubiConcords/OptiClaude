@@ -2,8 +2,13 @@ import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, SessionRateLimit } from 'claude-code'
 
 import type { Advice, Calibration, Stats, Tier } from '../types'
+import { type BudgetLimits, type BudgetSpend, type Period, budgetStatuses, percentOf } from './budgets'
+import { cacheRemainingMs, estimateNextSend } from './costEstimate'
 import { advise, compact, countTokens } from './estimate'
 import { LOGO_SVG, barSvg } from './logo'
+import { promptTips } from './promptTips'
+import { costSeriesSvg, sessionCsv, sessionTotals } from './history'
+import { logProvider } from './session'
 
 // OptiClaude never calls a model, the token-count API or a slash command that
 // writes to the transcript: every figure comes from local counting and from
@@ -11,10 +16,32 @@ import { LOGO_SVG, barSvg } from './logo'
 
 const PANE = 'opticlaude'
 const STORE_KEY = 'calibration'
+const SHARE_KEY = 'contextShareAlert'
+// Shares of the used context a category may take before it is highlighted.
+const SHARE_STEPS = [25, 40, 60]
+const BUDGET_KEY = 'budgets'
+const DISMISSED_KEY = 'dismissedTips'
+const HISTORY_KEY = 'history'
+// Enough turns for a month of use; older spend is dropped.
+const HISTORY_CAP = 5_000
+const PERIODS: Period[] = ['session', 'daily', 'weekly']
+const DEFAULT_LIMITS: BudgetLimits = { session: null, daily: null, weekly: null }
+// Each press moves a budget to the next of these USD limits, then back to off.
+const BUDGET_STEPS: Record<Period, (number | null)[]> = {
+  session: [null, 1, 5, 20],
+  daily: [null, 5, 20, 50],
+  weekly: [null, 25, 100, 250],
+}
+// One finished main-loop turn's spend, kept for the daily and weekly budgets and the history.
+type Spend = { at: number; session: string; usd: number }
 
 const draft = atom({ plugin: 'opticlaude', key: 'draft' } as const, '')
 const scratch = atom({ plugin: 'opticlaude', key: 'scratch' } as const, '')
 const isAuto = atom({ plugin: 'opticlaude', key: 'isAuto' } as const, false)
+const shareAlert = atom({ plugin: 'opticlaude', key: 'shareAlert' } as const, 40)
+const dismissedTips = atom({ plugin: 'opticlaude', key: 'dismissedTips' } as const, [] as string[])
+const copyNote = atom({ plugin: 'opticlaude', key: 'copyNote' } as const, '')
+const showHistory = atom({ plugin: 'opticlaude', key: 'showHistory' } as const, false)
 const armed = atom({ plugin: 'opticlaude', key: 'armed' } as const, null)
 const lastModel = atom({ plugin: 'opticlaude', key: 'lastModel' } as const, null)
 const calibration = atom({ plugin: 'opticlaude', key: 'calibration' } as const, {
@@ -46,6 +73,11 @@ const LIMITS: Record<string, string> = {
   seven_day: 'Weekly · all models',
 }
 
+// One colour per context category, in order of size; readable on light and dark themes.
+const CATEGORY_COLORS = ['#3b82f6', '#a855f7', '#14b8a6', '#eab308', '#ec4899', '#64748b']
+// Below this many columns (a narrow or collapsed sidebar) the pane shows only the key numbers.
+const COMPACT_COLUMNS = 34
+
 function duration(ms: number): string {
   const minutes = Math.round(ms / 60_000)
   if (minutes < 60) {
@@ -57,6 +89,10 @@ function duration(ms: number): string {
 
 function usd(value: number): string {
   return value < 1 ? `$${value.toFixed(3)}` : `$${value.toFixed(2)}`
+}
+
+function money(value: number | undefined): string {
+  return value === undefined ? 'n/a' : usd(value)
 }
 
 function sessionPercent(limits: readonly SessionRateLimit[]): number | undefined {
@@ -96,11 +132,21 @@ export const register: Register = on => {
   let percentAtStart: number | undefined
   let usdAtStart = 0
   let stopTicking: (() => void) | undefined
+  // Reads the session's transcript for the cache countdown and the next-send cost; created on first render.
+  let snapshots: ReturnType<typeof logProvider> | undefined
 
   on('session.start', async ($, e, next) => {
     const saved = (await $.store.get(STORE_KEY)) as Calibration | undefined
     if (saved?.trivial && saved.moderate && saved.heavy) {
       await update($, calibration, () => saved)
+    }
+    const savedShare = (await $.store.get(SHARE_KEY)) as number | undefined
+    if (typeof savedShare === 'number') {
+      await update($, shareAlert, () => savedShare)
+    }
+    const savedDismissed = (await $.store.get(DISMISSED_KEY)) as string[] | undefined
+    if (savedDismissed) {
+      await update($, dismissedTips, () => savedDismissed)
     }
     stopTicking?.()
     const timer = $.clock.every(1000, () => void update($, tick, n => n + 1))
@@ -208,6 +254,9 @@ export const register: Register = on => {
       if (turnUsd > 0) {
         const was = ((await $.store.get(LIFETIME_KEY)) as number | undefined) ?? 0
         await $.store.set(LIFETIME_KEY, was + turnUsd)
+        const entries = ((await $.store.get(HISTORY_KEY)) as Spend[] | undefined) ?? []
+        const session = await $.session.id()
+        await $.store.set(HISTORY_KEY, [...entries, { at: now, session, usd: turnUsd }].slice(-HISTORY_CAP))
       }
     }
     if (e.agentId !== undefined || turnTier === null) {
@@ -295,6 +344,47 @@ export const register: Register = on => {
     const lifetime = ((await $.store.get(LIFETIME_KEY)) as number | undefined) ?? 0
     // `summary` estimates each category locally: no request, no tokens.
     const breakdown = (await $.session.usage({ breakdown: 'summary', columns: e.props.bodyColumns })).context.breakdown
+    const alertAt = await read($, shareAlert)
+    const dismissed = await read($, dismissedTips)
+    const tips = promptTips(text).filter(tip => !dismissed.includes(tip.id))
+    const setDismissed = (next: string[]) => {
+      void $.store.set(DISMISSED_KEY, next)
+
+      return update($, dismissedTips, () => next)
+    }
+    snapshots ??= logProvider($)
+    const snap = await snapshots.read().catch(() => null)
+    const sendNow = snap ? estimateNextSend(snap.snapshot, countTokens(text)) : null
+    const caps = ((await $.store.get(BUDGET_KEY)) as BudgetLimits | undefined) ?? DEFAULT_LIMITS
+    const history = ((await $.store.get(HISTORY_KEY)) as Spend[] | undefined) ?? []
+    const sumSince = (from: number) => history.filter(h => h.at >= from).reduce((sum, h) => sum + h.usd, 0)
+    const spend: BudgetSpend = {
+      session: usage.cost?.usd ?? 0,
+      daily: sumSince(new Date(now).setHours(0, 0, 0, 0)),
+      weekly: sumSince(now - 7 * 24 * 3_600_000),
+    }
+    const note = await read($, copyNote)
+    const showing = await read($, showHistory)
+    const cacheLeft = snap ? cacheRemainingMs(snap.snapshot) : null
+    const cacheLine =
+      cacheLeft === null
+        ? 'unknown'
+        : cacheLeft > 0
+          ? `warm, ${Math.floor(Math.ceil(cacheLeft / 1000) / 60)}:${String(Math.ceil(cacheLeft / 1000) % 60).padStart(2, '0')} left`
+          : 'cold, the next prompt re-writes the context'
+    const contextLine = breakdown
+      ? `Context: ${compact(breakdown.totalTokens)} of ${compact(breakdown.rawMaxTokens)} tokens (${Math.round(percentOf(breakdown.totalTokens, breakdown.rawMaxTokens))}%)`
+      : `Context: ${compact(usage.context.tokens ?? 0)} tokens`
+    const summary = [
+      'OptiClaude session summary',
+      contextLine,
+      `Cost this session: ${usd(usage.cost?.usd ?? 0)}`,
+      `Cache: ${cacheLine}`,
+      'Top 3 offenders:',
+      ...(spent.bigTools.length > 0
+        ? spent.bigTools.map((tool, i) => `${i + 1}. ${tool.name}, about ${compact(tool.tokens)} tokens`)
+        : ['none yet']),
+    ].join('\n')
 
     const tokens = countTokens(text)
     const advice = advise(text)
@@ -337,6 +427,79 @@ export const register: Register = on => {
           <Text color="suggestion">{'█'.repeat(full)}</Text>
           <Text dimColor>{'░'.repeat(cells - full)}</Text>
         </Text>
+      )
+    }
+
+    // Stacked bar of the used context: each category takes its share of the window.
+    const contextBar = (parts: { tokens: number; color: string }[], whole: number) => {
+      const cells = Math.max(10, width)
+      let used = 0
+      const drawn = parts.map(part => {
+        const from = Math.round((used / whole) * cells)
+        used += part.tokens
+        const to = Math.min(cells, Math.round((used / whole) * cells))
+
+        return { color: part.color, cells: Math.max(0, to - from) }
+      })
+      const filled = drawn.reduce((sum, part) => sum + part.cells, 0)
+
+      return (
+        <Text>
+          {drawn.map((part, i) => (
+            <Text key={`segment-${i}`} color={part.color}>
+              {'█'.repeat(part.cells)}
+            </Text>
+          ))}
+          <Text dimColor>{'░'.repeat(Math.max(0, cells - filled))}</Text>
+        </Text>
+      )
+    }
+    // A category above the share is amber, and red at twice the share; the rest keep their palette colour.
+    const usedParts = breakdown
+      ? breakdown.categories
+          .filter(category => category.kind === 'used' && category.tokens > 0)
+          .sort((a, b) => b.tokens - a.tokens)
+          .map((category, i) => {
+            const share = percentOf(category.tokens, breakdown.totalTokens)
+            const palette = CATEGORY_COLORS[i % CATEGORY_COLORS.length] ?? '#64748b'
+            const color = share >= alertAt * 2 ? '#ef4444' : share > alertAt ? '#f59e0b' : palette
+
+            return { name: category.name, tokens: category.tokens, share, color }
+          })
+      : []
+    const cycleShare = () => {
+      const next = SHARE_STEPS[(SHARE_STEPS.indexOf(alertAt) + 1) % SHARE_STEPS.length] ?? 40
+      void $.store.set(SHARE_KEY, next)
+
+      return update($, shareAlert, () => next)
+    }
+
+    if (e.props.bodyColumns < COMPACT_COLUMNS) {
+      const cells = Math.max(8, width)
+      const contextPercentUsed = breakdown ? percentOf(breakdown.totalTokens, breakdown.rawMaxTokens) : 0
+      const full = Math.round((Math.min(100, contextPercentUsed) / 100) * cells)
+      const limit = usage.rateLimits.find(each => each.kind === 'five_hour')
+      const cacheShort =
+        cacheLeft === null ? 'n/a' : cacheLeft > 0 ? cacheLine.replace(/^warm, /, '').replace(' left', '') : 'cold'
+
+      return (
+        <Box flexDirection="column" gap={1}>
+          <Text color="#ff4545" bold>
+            OPTICLAUDE
+          </Text>
+          {breakdown && (
+            <Box flexDirection="column">
+              {row('Context', `${compact(breakdown.totalTokens)} of ${compact(breakdown.rawMaxTokens)}`)}
+              <Text>
+                <Text color="suggestion">{'█'.repeat(full)}</Text>
+                <Text dimColor>{'░'.repeat(cells - full)}</Text>
+              </Text>
+            </Box>
+          )}
+          {row('Cache', cacheShort)}
+          {usage.cost && row('Session', usd(usage.cost.usd))}
+          {limit && row('Session limit', `${limit.percentUsed.toFixed(1)}%`)}
+        </Box>
       )
     }
 
@@ -407,6 +570,22 @@ export const register: Register = on => {
           />
         )}
 
+        {tips.length > 0 && (
+          <Box flexDirection="column">
+            {tips.map(tip => (
+              <Box key={tip.id} flexDirection="row" justifyContent="space-between" alignItems="center" gap={1}>
+                <Text color={tip.severity === 'warn' ? 'warning' : undefined} size="caption">
+                  {tip.message}
+                </Text>
+                <Button key={`dismiss-${tip.id}`} label="×" onPress={() => setDismissed([...dismissed, tip.id])} />
+              </Box>
+            ))}
+          </Box>
+        )}
+        {dismissed.length > 0 && (
+          <Button key="tips-reset" label="Show tips again" onPress={() => setDismissed([])} />
+        )}
+
         {limits.length > 0 && (
           <Box flexDirection="column" gap={1}>
             {header('Usage')}
@@ -425,10 +604,15 @@ export const register: Register = on => {
         )}
 
         {(() => {
-          if (spent.lastCallAt === null) {
+          // The transcript's own cache clock when it can be read; else our count from the last response.
+          const left = snap
+            ? cacheRemainingMs(snap.snapshot)
+            : spent.lastCallAt === null
+              ? null
+              : CACHE_MS - (now - spent.lastCallAt)
+          if (left === null) {
             return row('Cache', 'no request yet')
           }
-          const left = CACHE_MS - (now - spent.lastCallAt)
           if (left <= 0) {
             return (
               <Box flexDirection="column">
@@ -453,6 +637,36 @@ export const register: Register = on => {
           {spent.turn && row('Last turn', usd(spent.turn.usd))}
           {usage.cost && row('This session', usd(usage.cost.usd))}
           {row('Running total', usd(Math.max(lifetime, usage.cost?.usd ?? 0)))}
+          {sendNow &&
+            row(
+              'Next send · warm · cold',
+              `${money(sendNow.warm.totalUsd?.expected)} · ${money(sendNow.cold.totalUsd?.expected)}`,
+            )}
+        </Box>
+
+        <Box flexDirection="column">
+          {header('Budgets')}
+          {budgetStatuses(caps, spend).map(st => (
+            <Box key={st.period} flexDirection="column">
+              {row(`${st.period} · ${usd(st.spent)} of ${usd(st.limit)}`, `${Math.round(st.percent)}%`)}
+              {bar(st.percent)}
+              {st.exceeded && <Text color="#ef4444">{st.period} budget exceeded</Text>}
+            </Box>
+          ))}
+          <Box flexDirection="row" gap={1}>
+            {PERIODS.map(period => (
+              <Button
+                key={`budget-${period}`}
+                label={`${period} ${caps[period] === null ? 'off' : `$${caps[period]}`}`}
+                onPress={() => {
+                  const steps = BUDGET_STEPS[period]
+                  const next = steps[(steps.indexOf(caps[period]) + 1) % steps.length] ?? null
+
+                  return $.store.set(BUDGET_KEY, { ...caps, [period]: next })
+                }}
+              />
+            ))}
+          </Box>
         </Box>
 
         {spent.turn && (
@@ -495,11 +709,16 @@ export const register: Register = on => {
         {breakdown && (
           <Box flexDirection="column">
             {header(`Context · ${compact(breakdown.totalTokens)} of ${compact(breakdown.rawMaxTokens)}`)}
-            {breakdown.categories
-              .filter(category => category.kind === 'used' && category.tokens > 0)
-              .sort((a, b) => b.tokens - a.tokens)
-              .slice(0, 5)
-              .map(category => row(category.name, compact(category.tokens)))}
+            {contextBar(usedParts, Math.max(1, breakdown.rawMaxTokens))}
+            {usedParts.map(part => (
+              <Box key={part.name} flexDirection="row" justifyContent="space-between">
+                <Text color={part.color}>
+                  ■ {part.name} {Math.round(part.share)}%
+                </Text>
+                <Text tabular>{compact(part.tokens)}</Text>
+              </Box>
+            ))}
+            <Button key="share" label={`Highlight above ${alertAt}%`} onPress={cycleShare} />
             {breakdown.isAutoCompactEnabled &&
               breakdown.autoCompactThreshold !== undefined &&
               breakdown.totalTokens >= breakdown.autoCompactThreshold * 0.8 && (
@@ -529,6 +748,55 @@ export const register: Register = on => {
           </Box>
         )}
 
+        <Box flexDirection="column">
+          {showing && (
+            <Box flexDirection="column">
+              {header('History')}
+              {history.length === 0 ? (
+                <Text dimColor>No finished turns recorded yet.</Text>
+              ) : (
+                <Box flexDirection="column">
+                  {Svg && (
+                    <Svg source={costSeriesSvg(history, 280, 60)} alt="Cumulative cost over time" width={280} />
+                  )}
+                  {sessionTotals(history)
+                    .slice(-5)
+                    .map(total =>
+                      row(`${total.session.slice(0, 8)} · ${total.turns} turns`, usd(total.usd)),
+                    )}
+                </Box>
+              )}
+              <Button
+                key="history-csv"
+                label="Copy CSV"
+                onPress={press =>
+                  $.ui
+                    .copy({ text: sessionCsv(history), surface: press.surface })
+                    .then(result => update($, copyNote, () => (result.isCopied ? 'CSV copied' : `Not copied: ${result.reason}`)))
+                }
+              />
+            </Box>
+          )}
+          <Button
+            key="history-toggle"
+            label={showing ? 'Hide history' : 'Show history'}
+            onPress={() => update($, showHistory, was => !was)}
+          />
+        </Box>
+        <Button
+          key="copy-summary"
+          label="Copy summary"
+          onPress={press =>
+            $.ui
+              .copy({ text: summary, surface: press.surface })
+              .then(result => update($, copyNote, () => (result.isCopied ? 'Summary copied' : `Not copied: ${result.reason}`)))
+          }
+        />
+        {note && (
+          <Text dimColor size="caption">
+            {note}
+          </Text>
+        )}
         <Text dimColor size="caption">
           Estimated locally · costs 0 tokens
         </Text>
