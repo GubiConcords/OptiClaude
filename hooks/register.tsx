@@ -801,7 +801,7 @@ export const register: Register = on => {
           Estimated locally · costs 0 tokens
         </Text>
         <Text dimColor size="caption">
-          v1.0
+          v1.0.2
         </Text>
       </Box>
     )
